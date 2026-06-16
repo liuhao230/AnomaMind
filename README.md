@@ -197,7 +197,7 @@ torchrun --standalone --nproc_per_node=4 --master_port=47086 \
   --gradient_checkpointing \
   --fsdp
 ```
-### 4. RL Training
+### 5. RL Training
 #### Build RL Parquet
 
 Convert the merged SFT CSV into RL parquet files.
@@ -231,7 +231,7 @@ export CKPT_DIR=/PATH/AnomaMind/models/RL
 
 bash scripts/run_verl.sh
 ```
-### 5. Evaluation
+### 6. Evaluation
 
 #### Start the RL model with vLLM
 
@@ -302,6 +302,8 @@ AnomaMind achieves competitive or best average performance across Precision, Rec
 ```
 AnomaMind/
 ├── README.md
+├── LICENSE
+├── pyproject.toml
 ├── requirements.txt
 ├── data/              # Place benchmark data here
 ├── assets/            # Figures for README
