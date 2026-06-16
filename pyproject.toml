@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "AnomaMind"
+version = "0.1.0"
+description = "Time-series anomaly detection pipeline for data prep, inference, evaluation, and training."
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "AnomaMind contributors" }]
+dependencies = []
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = false
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

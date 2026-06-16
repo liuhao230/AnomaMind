@@ -49,25 +49,19 @@ Existing TSAD methods often treat anomaly detection as a static discriminative t
 ### 1. Clone the repo
 
 ```bash
-git clone https://github.com/Xiaoyu-Tao/AnomaMind-TS
-cd AnomaMind-TS
+git clone https://github.com/ustc-time-series/AnomaMind.git
+cd AnomaMind
 ```
 
 ### 2. Environment Setup
 
 ```bash
-conda create -n anomalmind python=3.10
+conda create -n anomalmind python=3.10 -y
 conda activate anomalmind
-sh install.sh
+pip install -r requirements.txt
+pip install -e . --no-build-isolation
 ```
 
-Create `scripts/.env` with your API config:
-
-```
-LLM_API_KEY=your_api_key_here
-LLM_BASE_URL=https://api.example.com/v1
-AUX_LLM_MODEL=your_model_name
-```
 
 ### 3. Prepare Data
 
@@ -78,48 +72,203 @@ AnomaMind is evaluated on four TSAD benchmarks with diverse anomaly types (point
 
 Datasets can be downloaded from [here](https://www.thedatum.org/datasets/TSB-AD-U.zip). 
 
-Extract the CSV files and split them into training and testing sets.
+#### Put data in place
+Create the dataset under `data/<name>/`:
 
-Please organize the files into the following directory structure:
-
-- Training Data: Place CSV files in `dataset/train/raw/`
-- Testing Data: Place CSV files in `dataset/test/raw/`
-
-
-### 4. Run Anomaly Detection
-
-**Step 1: Preprocess Data**
-
-```bash
-cd ./scripts
-python preprocess.py ../dataset/train/raw ../dataset/train/processed --segment_size 100 --sample_ratio 1.0
-python preprocess.py ../dataset/test/raw ../dataset/test/processed --segment_size 100 --sample_ratio 1.0
+```text
+data/<name>/
+├── <name>.yaml
+└── raw/
+    ├── in-series/
+    └── cross-series/
 ```
 
-**Step 2: RL Train**
+- `<name>.yaml`: dataset config
+- `raw/in-series/`: CSV files used for train and test
+- `raw/cross-series/`: extra CSV files used for train only
 
-```bash
-python train_full_workflow.py --train_data ../dataset/train/processed --model Qwen/Qwen3-8B --output_dir ../model --epochs 2
+#### Write the YAML
+
+Use this format:
+
+```yaml
+segment_size: 100
+processed_train_anomaly_ratio: 0.7
+processed_test_anomaly_ratio: 0
 ```
 
-**Step 3: Serve the trained model with vLLM**
+#### Prepare the CSV files
+
+Each CSV should contain the value column and `Label`.
+
+- `in-series` files are split into train and test
+- `cross-series` files are added to train only
+
+#### Run the command
 
 ```bash
-# Replace the path with your checkpoint
-vllm serve ./model/PATH/TO/HUGGINGFACE --port 8000 --max-model-len 11000 --gpu-memory-utilization 0.95 --enable-auto-tool-choice --tool-call-parser hermes --served-model-name detector
+python -m AnomaMind.dataprep.build_dataset data/<name>
 ```
 
-**Step 4: Inference**
+#### Output structure
+
+After the command finishes, you will get:
+
+```text
+data/<name>/
+├── raw/
+│   ├── train/
+│   └── test/
+├── cluster/
+└── processed/
+    ├── train/
+    ├── test/
+    └── train_off/
+```
+
+### 4. SFT Training
+
+#### Prepare env files
+
+Create these files under `env/`:
+
+- `actor.env`
+- `detector.env`
+- `locator.env`
+- `evaluator.env`
+
+Example:
+
+```env
+LLM_API_KEY=YOUR_LLM_KEY
+LLM_BASE_URL=YOUR_LLM_URL
+AUX_LLM_MODEL=YOUR_LLM_NAME
+```
+
+#### Run inference to collect SFT data
+
+Use the processed train set as input and write results to `result/train`:
 
 ```bash
-python infer.py -i ../dataset/test/processed -o ../results -m detector -u http://localhost:8000/v1 --enable_checking -w 4
+python -m AnomaMind.infer.infer \
+  data/<name>/processed/train \
+  --output-dir data/<name>/result/train \
+  --workers 8 \
+  --max-retries 3 \
+  --no-reflection
 ```
 
-**Step 5: Evaluate**
+
+#### Build SFT CSV
+
+Merge multiple collected result folders into one cross-domain SFT CSV:
 
 ```bash
-python eval.py --results_dir ../results --output ../evaluation_results.json
+python -m AnomaMind.train.prepare_sft_data \
+  --mode multi \
+  --res_root data \
+  --datasets KPI WSD IOPS YAHOO \
+  --output_csv data/cross_domain/sft.csv \
+  --balance upsample \
+  --max_prompt_tokens 7000 \
+  --tokenizer_path /PATH/TO/TOKENIZER \
+  --shuffle
 ```
+
+`--max_prompt_tokens` is the prompt length filter threshold.
+
+`--tokenizer_path` must point to the tokenizer used for prompt filtering.
+
+#### SFT Training
+
+Train from the merged CSV
+
+Example:
+
+```bash
+torchrun --standalone --nproc_per_node=4 --master_port=47086 \
+  -m AnomaMind.train.sft \
+  --model_path /PATH/TO/BASE_MODEL \
+  --train_csv data/cross_domain/sft.csv \
+  --output_dir /PATH/AnomaMind/models/SFT \
+  --per_device_train_batch_size 2 \
+  --gradient_accumulation_steps 8 \
+  --bf16 \
+  --gradient_checkpointing \
+  --fsdp
+```
+### 4. RL Training
+#### Build RL Parquet
+
+Convert the merged SFT CSV into RL parquet files.
+Use the same tokenizer and prompt-length threshold here as in SFT CSV preparation:
+
+```bash
+python -m AnomaMind.train.prepare_rl_data \
+  --mode csv \
+  --csv data/cross_domain/sft.csv \
+  --out-dir data/cross_domain/RL \
+  --data-source anomamind/cross_domain \
+  --ability ts_anomaly_detection \
+  --max-prompt-tokens 7000 \
+  --tokenizer-path /PATH/TO/TOKENIZER \
+  --val-ratio 0
+```
+
+
+#### Training Command
+
+Run RL with the parquet data and the SFT model.
+
+Example:
+
+```bash
+export TRAIN_PARQUET=/PATH/AnomaMind/data/cross_domain/RL/train.parquet
+export VAL_PARQUET=/PATH/AnomaMind/data/cross_domain/RL/val.parquet
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
+export MODEL_PATH=/PATH/AnomaMind/models/SFT
+export CKPT_DIR=/PATH/AnomaMind/models/RL
+
+bash scripts/run_verl.sh
+```
+### 5. Evaluation
+
+#### Start the RL model with vLLM
+
+```bash
+ASCEND_DEVICES=0,1,2,3 MODEL_PATH=/PATH/AnomaMind/models/RL bash scripts/serve_vllm.sh
+```
+
+#### Point `env/detector.env` to the local server
+
+Before running evaluation inference, replace `env/detector.env` with:
+
+```env
+LLM_API_KEY=dummy
+LLM_BASE_URL=http://localhost:8098/v1
+AUX_LLM_MODEL=detector
+```
+
+#### Run inference on each test set
+
+```bash
+python -m AnomaMind.infer.infer \
+  data/<name>/processed/test \
+  --output-dir data/<name>/result/test \
+  --workers 8 \
+  --max-retries 3
+```
+
+#### Evaluate the results
+
+Run the evaluation script on the result directory:
+
+```bash
+python -m AnomaMind.eval.evaluate_results data/<name>/result/test
+```
+
+
+
 
 ## 📊 Benchmark Results
 
@@ -151,13 +300,14 @@ AnomaMind achieves competitive or best average performance across Precision, Rec
 ## 📁 Project Structure
 
 ```
-AnomaMind-TS/
+AnomaMind/
 ├── README.md
-├── install.sh
 ├── requirements.txt
-├── dataset/           # Place benchmark data here
-├── assets/            # Figures for README (main.png, ablation plots, etc.)
-└── scripts/           # Run scripts for each benchmark
+├── data/              # Place benchmark data here
+├── assets/            # Figures for README
+├── env/               # Local env examples
+├── scripts/           # Training / serving scripts
+└── src/               # Python package source
 ```
 
 ## 🤖 Model Zoo

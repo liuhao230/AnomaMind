@@ -1,22 +1,32 @@
-# Core
+# Core runtime
+torch==2.8.0
+torchvision==0.23.0
 transformers==4.57.6
+datasets>=3.0.0
+accelerate>=1.0.0
+tokenizers>=0.21.0
 python-dotenv>=1.2.0
 pandas>=2.0.0
 numpy>=1.24.0
-
-# Preprocess
+scikit-learn>=1.4.0
+pyarrow>=15.0.0
 matplotlib>=3.7.0
 scipy>=1.11.0
 tqdm>=4.65.0
+pillow>=10.0.0
 
-# LLM / Agent (batch_process, inference)
+# LLM / Agent stack
 langchain>=1.0.0
 langchain-core>=1.0.0
 langchain-openai>=1.0.0
 langgraph>=1.0.0
 openai>=1.0.0
+agentlightning>=0.3.0
+vllm==0.10.2
+verl==0.5.0
+flash-attn
 
-# Dependencies (pulled by above, pinned for reproducibility)
+# Dependencies pulled by the stack
 pydantic>=2.0.0
 httpx>=0.25.0
 requests>=2.28.0

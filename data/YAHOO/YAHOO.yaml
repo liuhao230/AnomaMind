@@ -1,0 +1,3 @@
+segment_size: 100
+processed_train_anomaly_ratio: 0.7
+processed_test_anomaly_ratio: 1
