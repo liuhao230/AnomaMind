@@ -46,6 +46,10 @@ Existing TSAD methods often treat anomaly detection as a static discriminative t
 
 ## 🚀 Getting Started
 
+For optional per-pass diagnostic traces, CPU training of a small redo controller,
+and cost-aware inference, see [Diagnostic traces and budget controller](docs/budget-controller.md).
+The original inference behavior remains the default.
+
 ### 1. Clone the repo
 
 ```bash

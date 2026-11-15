@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import re
+from contextvars import copy_context
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable
 
@@ -166,7 +167,9 @@ class Evaluator:
         results: dict[str, str] = {}
         max_workers = min(3, len(jobs))
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            future_map = {pool.submit(fn): key for key, fn in jobs}
+            # Preserve LangChain's callback context in compression workers. Each
+            # job needs its own context; a Context cannot run concurrently.
+            future_map = {pool.submit(copy_context().run, fn): key for key, fn in jobs}
             for fut in future_map:
                 key = future_map[fut]
                 try:

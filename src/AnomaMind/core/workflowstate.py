@@ -22,3 +22,5 @@ class WorkflowState(TypedDict, total=False):
     has_error: bool
     error_message: str
     final_output: dict
+    diagnostic_passes: list[dict[str, Any]]
+    diagnostic_decision: dict[str, Any]
