@@ -27,7 +27,9 @@ Each segment produces ``<segment>.json`` and, unless disabled, the same PNG arti
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import math
 import os
 import shutil
 import sys
@@ -103,6 +105,8 @@ class InferConfig:
     retry_delay: float
     show_progress: bool
     force: bool
+    capture_diagnostics: bool = False
+    controller_info: dict[str, Any] | None = None
 
 
 def _gv(d: dict, key: str, default=None):
@@ -199,7 +203,9 @@ def _exit_code_from_smoke_json(data: dict) -> int:
     return 0
 
 
-def _smoke_segment_done_ok(output_dir: Path, stem: str) -> bool:
+def _smoke_segment_done_ok(
+    output_dir: Path, stem: str, *, capture_diagnostics: bool = False, controller_info=None,
+) -> bool:
     json_path = output_dir / f"{stem}.json"
     if not json_path.is_file():
         return False
@@ -207,7 +213,12 @@ def _smoke_segment_done_ok(output_dir: Path, stem: str) -> bool:
         data = json.loads(json_path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return False
-    return _exit_code_from_smoke_json(data) == 0
+    if _exit_code_from_smoke_json(data) != 0:
+        return False
+    diagnostics = data.get("diagnostics") or {}
+    if capture_diagnostics and diagnostics.get("schema_version") != 1:
+        return False
+    return diagnostics.get("controller") == controller_info
 
 
 def _summary_row_from_resume_json(output_dir: Path, stem: str, seg_dir: Path) -> dict[str, Any]:
@@ -234,6 +245,8 @@ def build_segment_tasks(
     *,
     output_dir: Path,
     force: bool,
+    capture_diagnostics: bool = False,
+    controller_info=None,
 ) -> list[SegmentTask]:
     tasks: list[SegmentTask] = []
     for index, seg_dir in enumerate(sorted(Path(p).resolve() for p in segments)):
@@ -243,7 +256,9 @@ def build_segment_tasks(
                 index=index,
                 seg_dir=seg_dir,
                 stem=stem,
-                skip_existing_ok=(not force and _smoke_segment_done_ok(output_dir, stem)),
+                skip_existing_ok=(not force and _smoke_segment_done_ok(
+                    output_dir, stem, capture_diagnostics=capture_diagnostics, controller_info=controller_info,
+                )),
             )
         )
     return tasks
@@ -400,7 +415,10 @@ def _load_llm_configs(*, load_evaluator: bool = True):
     return locator_cfg, actor_cfg, detector_cfg, evaluator_cfg
 
 
-def _make_workflow_factory(*, max_turns: int, enable_reflection: bool) -> Callable[[], Any]:
+def _make_workflow_factory(
+    *, max_turns: int, enable_reflection: bool,
+    capture_diagnostics: bool = False, controller=None, controller_cost_weight: float = 0.0,
+) -> Callable[[], Any]:
     from AnomaMind.workflows.AnomaAgent import AnomaAgent
 
     locator_cfg, actor_cfg, detector_cfg, evaluator_cfg = _load_llm_configs(
@@ -415,6 +433,9 @@ def _make_workflow_factory(*, max_turns: int, enable_reflection: bool) -> Callab
             detector_config=detector_cfg,
             evaluator_config=evaluator_cfg,
             enable_reflection=enable_reflection,
+            capture_diagnostics=capture_diagnostics,
+            controller=controller,
+            controller_cost_weight=controller_cost_weight,
         )
         return agent.build_workflow()
 
@@ -472,7 +493,20 @@ def _run_segment_once(
     }
 
     workflow = workflow_factory()
-    out = workflow.invoke(state, {"recursion_limit": 200})
+    run_config: dict[str, Any] = {"recursion_limit": 200}
+    recorder = None
+    if config.capture_diagnostics:
+        from AnomaMind.core.diagnostics import DiagnosticRecorder
+        recorder = DiagnosticRecorder()
+        run_config.update(recorder.runnable_config())
+    try:
+        out = workflow.invoke(state, run_config)
+    except Exception as exc:
+        if recorder is None:
+            raise
+        # Retain spent calls even when an exception prevents a graph result.
+        out = {**state, "has_error": True, "error_message": str(exc),
+               "final_output": {"error": True, "error_message": str(exc), "anomaly_intervals": []}}
     fo = out.get("final_output") or {}
     actor_messages_export = export_messages(out.get("actor_messages") or [])
     detector_messages_export = export_messages(out.get("detector_messages") or [])
@@ -505,6 +539,22 @@ def _run_segment_once(
         "redo": bool(out.get("redo")),
         "suggestion": str(out.get("suggestion") or ""),
     }
+    if recorder is not None:
+        from AnomaMind.core.utils import get_column_names, load_segment_meta
+        meta = load_segment_meta(task.seg_dir)
+        index_col, _ = get_column_names(pack["segment_data"])
+        payload["diagnostics"] = {
+            "schema_version": 1,
+            "run_id": recorder.run_id,
+            "controller": config.controller_info,
+            "cost_unit": "llm_calls",
+            "series_id": f"{pack['type']}:{meta.get('series_stem') or meta.get('global_data_file')}",
+            "segment_id": task.stem,
+            "observed_indices": [int(i) for i in pack["segment_data"][index_col]],
+            "passes": out.get("diagnostic_passes", []),
+            "termination": out.get("diagnostic_decision", {}),
+            "usage": recorder.snapshot(),
+        }
     if not config.no_debug_artifacts:
         payload["ground_truth_intervals"] = gt_intervals
         payload["smoke_point_eval"] = smoke_eval
@@ -536,6 +586,8 @@ def _run_segment_once(
     }
     if rc != 0:
         row["error"] = str(fo.get("error_message") or out.get("error_message") or "unknown error")
+    if recorder is not None:
+        row["_diagnostics"] = payload["diagnostics"]
     return rc, row
 
 
@@ -549,14 +601,19 @@ def run_task_with_retries(
     attempts = 0
     last_row: Optional[dict[str, Any]] = None
     last_error: Optional[str] = None
+    diagnostic_attempts = []
 
     while attempts < max(1, int(max_retries)):
         attempts += 1
         try:
             rc, row = run_once(task)
+            trace = row.pop("_diagnostics", None)
+            if trace is not None:
+                diagnostic_attempts.append(trace)
             last_row = row
             if rc == 0:
-                return {"task": task, "rc": rc, "row": row, "attempts": attempts, "error": None}
+                return {"task": task, "rc": rc, "row": row, "attempts": attempts, "error": None,
+                        "diagnostic_attempts": diagnostic_attempts}
             last_error = str(row.get("error") or f"non-zero exit_code={rc}")
         except Exception as exc:
             last_error = str(exc)
@@ -581,6 +638,7 @@ def run_task_with_retries(
         "row": last_row,
         "attempts": attempts,
         "error": last_error,
+        "diagnostic_attempts": diagnostic_attempts,
     }
 
 
@@ -596,6 +654,20 @@ def _execute_tasks(
         return _run_segment_once(task, workflow_factory=workflow_factory, config=config)
 
     pending = [task for task in tasks if not task.skip_existing_ok]
+
+    def _persist_attempts(result: dict) -> None:
+        attempts = result.get("diagnostic_attempts") or []
+        if not attempts:
+            return
+        path = config.output_dir / f"{result['task'].stem}.json"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["previous_diagnostic_attempts"] = attempts[:-1]
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        result["row"]["diagnostic_usage"] = {
+            key: sum(a["usage"][key] for a in attempts)
+            for key in ("llm_calls", "failed_llm_calls", "input_tokens", "output_tokens",
+                        "calls_without_token_usage", "elapsed_seconds")
+        }
     for task in tasks:
         if task.skip_existing_ok:
             rows_by_index[task.index] = _summary_row_from_resume_json(config.output_dir, task.stem, task.seg_dir)
@@ -612,7 +684,8 @@ def _execute_tasks(
                 max_retries=config.max_retries,
                 retry_delay=config.retry_delay,
             )
-            if result["rc"] != 0 and result["error"]:
+            _persist_attempts(result)
+            if result["rc"] != 0 and result["error"] and not result["diagnostic_attempts"]:
                 _write_error_payload(task, config.output_dir, str(result["error"]))
             row = dict(result["row"])
             row["attempts"] = int(result["attempts"])
@@ -640,7 +713,8 @@ def _execute_tasks(
         for future in completion_iter:
             task = future_map[future]
             result = future.result()
-            if result["rc"] != 0 and result["error"]:
+            _persist_attempts(result)
+            if result["rc"] != 0 and result["error"] and not result["diagnostic_attempts"]:
                 _write_error_payload(task, config.output_dir, str(result["error"]))
             row = dict(result["row"])
             row["attempts"] = int(result["attempts"])
@@ -679,6 +753,9 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help="Output dir for per-segment json/png and _smoke_summary.json",
     )
     parser.add_argument("--max-turns", type=int, default=6, help="Detector max_turns per segment (default 6)")
+    parser.add_argument("--capture-diagnostics", action="store_true", help="Keep each diagnostic pass and LLM usage for controller training")
+    parser.add_argument("--controller-model", type=Path, help="JSON redo-controller model; automatically enables diagnostics")
+    parser.add_argument("--controller-cost-weight", type=float, default=0.0, help="Quality penalty per additional LLM call; select on validation data")
     parser.add_argument(
         "--no-reflection",
         action="store_true",
@@ -703,7 +780,12 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Ignore successful outputs and rerun all segments (default: skip ok, retry failures)",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.controller_model and args.no_reflection:
+        parser.error("--controller-model requires reflection; remove --no-reflection")
+    if not math.isfinite(args.controller_cost_weight) or args.controller_cost_weight < 0:
+        parser.error("--controller-cost-weight must be finite and nonnegative")
+    return args
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -712,6 +794,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     _autoload_env_files(override=False)
 
     args = parse_args(argv)
+    controller = None
+    if args.controller_model:
+        from AnomaMind.core.budget_controller import BudgetController
+        controller = BudgetController.load(args.controller_model)
 
     input_path = args.input_path.resolve()
     output_dir = args.output_dir.resolve()
@@ -747,9 +833,17 @@ def main(argv: Optional[list[str]] = None) -> int:
         retry_delay=max(0.0, float(args.retry_delay)),
         show_progress=not bool(args.no_progress),
         force=bool(args.force),
+        capture_diagnostics=bool(args.capture_diagnostics or controller is not None),
+        controller_info={
+            "sha256": hashlib.sha256(args.controller_model.read_bytes()).hexdigest(),
+            "cost_weight": args.controller_cost_weight,
+        } if args.controller_model else None,
     )
 
-    tasks = build_segment_tasks(segments, output_dir=output_dir, force=config.force)
+    tasks = build_segment_tasks(
+        segments, output_dir=output_dir, force=config.force,
+        capture_diagnostics=config.capture_diagnostics, controller_info=config.controller_info,
+    )
     if not config.force:
         print(
             f"[resume] output-dir={output_dir} "
@@ -760,6 +854,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     workflow_factory = _make_workflow_factory(
         max_turns=config.max_turns,
         enable_reflection=config.enable_reflection,
+        capture_diagnostics=config.capture_diagnostics,
+        controller=controller,
+        controller_cost_weight=args.controller_cost_weight,
     )
     rows_by_index = _execute_tasks(tasks, workflow_factory=workflow_factory, config=config)
     summary_rows = _sorted_summary_rows(rows_by_index)
@@ -771,6 +868,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         "output_dir": str(output_dir),
         "max_turns": config.max_turns,
         "enable_reflection": config.enable_reflection,
+        "capture_diagnostics": config.capture_diagnostics,
+        "controller_model": str(args.controller_model) if args.controller_model else None,
+        "controller_cost_weight": args.controller_cost_weight,
         "workers": config.workers,
         "max_retries": config.max_retries,
         "retry_delay": config.retry_delay,
